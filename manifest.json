@@ -1,0 +1,10 @@
+{
+  "name": "anticheat",
+  "display_name": "Cheater Detector",
+  "version": "0.3.0",
+  "description": "Monitors players in your game and flags patterns to identify likely cheaters.",
+  "author": "Hexze",
+  "homepage": null,
+  "dependencies": [],
+  "min_starfish_version": null
+}
