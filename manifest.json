@@ -1,8 +1,8 @@
 {
   "name": "anticheat",
   "display_name": "Cheater Detector",
-  "version": "0.3.0",
-  "description": "Monitors players in your game and flags patterns to identify likely cheaters.",
+  "version": "0.4.0",
+  "description": "Monitors players in your game and flags patterns to identify likely cheaters",
   "author": "Hexze",
   "homepage": null,
   "dependencies": [],
