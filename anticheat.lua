@@ -1,18 +1,14 @@
--- Anticheat Plugin
--- Detects potential cheaters on Hypixel
--- Adapted from Pug's Custom Anticheat Raven script (github.com/PugrillaDev)
-
 plugin = {
     name = "anticheat",
     displayName = "Cheater Detector",
     prefix = "§cAC",
-    version = "0.3.0",
-    author = "Hexze",
-    description = [[
-Monitors players in your game and flags patterns to identify likely cheaters.]]
+    version = "0.4.0",
+    credits = "",
+    description = "Advanced cheater detector system"
 }
 
--- Check definitions with defaults
+-- Check definitions
+
 local CHECK_DEFINITIONS = {
     NoSlowA = {
         enabled = true,
@@ -64,21 +60,28 @@ local CHECK_DEFINITIONS = {
     }
 }
 
--- Config helper: config.get auto-returns schema defaults when no value is stored
+-- Config
+
+local configCache = {}
+
 local function getCheckConfig(checkName)
+    local cached = configCache[checkName]
+    if cached then return cached end
+
     local def = CHECK_DEFINITIONS[checkName]
     if not def then return nil end
 
-    return {
+    cached = {
         enabled = starfish.config.get("checks." .. checkName .. ".enabled"),
         sound = starfish.config.get("checks." .. checkName .. ".sound"),
         vl = starfish.config.get("checks." .. checkName .. ".vl"),
         cooldown = starfish.config.get("checks." .. checkName .. ".cooldown"),
         description = def.description
     }
+    configCache[checkName] = cached
+    return cached
 end
 
--- Register config schema
 for checkName, checkDef in pairs(CHECK_DEFINITIONS) do
     starfish.schema.section({
         key = checkName,
@@ -104,17 +107,18 @@ for checkName, checkDef in pairs(CHECK_DEFINITIONS) do
     })
 end
 
--- Player tracking
+-- State
+
 local players = {}
 local playersByUuid = {}
 local entityToPlayer = {}
 local uuidToName = {}
 local uuidToDisplayName = {}
-
--- Tick counter for time tracking
+local flagHistory = {}
 local currentTick = 0
 
 -- Item IDs
+
 local SWORD_IDS = { [267] = true, [268] = true, [272] = true, [276] = true, [283] = true }
 local CONSUMABLE_IDS = {
     [260] = true, [297] = true, [319] = true, [320] = true, [322] = true,
@@ -125,12 +129,12 @@ local CONSUMABLE_IDS = {
     [413] = true, [423] = true, [424] = true
 }
 
--- Helper to get current time in ms
+-- Helpers
+
 local function getTime()
     return os.clock() * 1000
 end
 
--- Create player data object
 local function createPlayerData(uuid, name, entityId)
     return {
         uuid = uuid,
@@ -191,7 +195,6 @@ local function createPlayerData(uuid, name, entityId)
     }
 end
 
--- Helper functions
 local function getItemId(player)
     if not player.heldItem then return nil end
     return player.heldItem.blockId or player.heldItem.itemId or player.heldItem.id
@@ -216,112 +219,13 @@ local function isHoldingBlock(player)
     return id and id < 256
 end
 
-local NON_SOLID_BLOCKS = {
-    [0] = true,    -- Air
-    [6] = true,    -- Sapling
-    [8] = true,    -- Water
-    [9] = true,    -- Stationary water
-    [10] = true,   -- Lava
-    [11] = true,   -- Stationary lava
-    [27] = true,   -- Powered rail
-    [28] = true,   -- Detector rail
-    [30] = true,   -- Cobweb
-    [31] = true,   -- Tall grass
-    [32] = true,   -- Dead bush
-    [37] = true,   -- Dandelion
-    [38] = true,   -- Poppy
-    [39] = true,   -- Brown mushroom
-    [40] = true,   -- Red mushroom
-    [50] = true,   -- Torch
-    [51] = true,   -- Fire
-    [55] = true,   -- Redstone wire
-    [59] = true,   -- Wheat crops
-    [63] = true,   -- Standing sign
-    [65] = true,   -- Ladder
-    [66] = true,   -- Rail
-    [68] = true,   -- Wall sign
-    [69] = true,   -- Lever
-    [70] = true,   -- Stone pressure plate
-    [72] = true,   -- Wood pressure plate
-    [75] = true,   -- Redstone torch off
-    [76] = true,   -- Redstone torch on
-    [77] = true,   -- Stone button
-    [78] = true,   -- Snow layer
-    [83] = true,   -- Sugar cane
-    [90] = true,   -- Nether portal
-    [93] = true,   -- Repeater off
-    [94] = true,   -- Repeater on
-    [104] = true,  -- Pumpkin stem
-    [105] = true,  -- Melon stem
-    [106] = true,  -- Vines
-    [111] = true,  -- Lily pad
-    [115] = true,  -- Nether wart
-    [119] = true,  -- End portal
-    [131] = true,  -- Tripwire hook
-    [132] = true,  -- Tripwire
-    [141] = true,  -- Carrots
-    [142] = true,  -- Potatoes
-    [143] = true,  -- Wood button
-    [147] = true,  -- Light weighted pressure plate
-    [148] = true,  -- Heavy weighted pressure plate
-    [149] = true,  -- Comparator off
-    [150] = true,  -- Comparator on
-    [157] = true,  -- Activator rail
-    [171] = true,  -- Carpet
-    [175] = true,  -- Double plant
-    [176] = true,  -- Standing banner
-    [177] = true,  -- Wall banner
-}
-
-local function isBlockSolid(blockId)
-    if blockId == nil then return false end
-    return not NON_SOLID_BLOCKS[blockId]
-end
-
-local function rayTraceBlocks(x1, y1, z1, x2, y2, z2)
-    local dx = x2 - x1
-    local dy = y2 - y1
-    local dz = z2 - z1
-    local distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-    if distance < 0.1 then return false end
-
-    local steps = math.ceil(distance * 4)
-    local stepX = dx / steps
-    local stepY = dy / steps
-    local stepZ = dz / steps
-
-    local lastBlockX, lastBlockY, lastBlockZ = nil, nil, nil
-
-    for i = 1, steps - 1 do
-        local x = x1 + stepX * i
-        local y = y1 + stepY * i
-        local z = z1 + stepZ * i
-
-        local blockX = math.floor(x)
-        local blockY = math.floor(y)
-        local blockZ = math.floor(z)
-
-        if blockX ~= lastBlockX or blockY ~= lastBlockY or blockZ ~= lastBlockZ then
-            local block = starfish.world.getBlock(blockX, blockY, blockZ)
-            if block and isBlockSolid(block.id) then
-                return true
-            end
-            lastBlockX, lastBlockY, lastBlockZ = blockX, blockY, blockZ
-        end
-    end
-
-    return false
-end
-
 local function normalizeYaw(yaw)
     yaw = yaw % 360
     if yaw > 180 then yaw = yaw - 360 end
-    if yaw < 180 then yaw = yaw + 360 end
+    if yaw < -180 then yaw = yaw + 360 end
     return yaw
 end
 
--- Update player position and calculate velocity
 local function updatePosition(player, x, y, z, onGround, yaw, pitch)
     player.lastPosition = { x = player.position.x, y = player.position.y, z = player.position.z }
     player.position = { x = x, y = y, z = z }
@@ -353,6 +257,7 @@ local function updatePosition(player, x, y, z, onGround, yaw, pitch)
 end
 
 -- Violation management
+
 local function addViolation(player, checkName, amount)
     amount = amount or 1
     player.violations[checkName] = (player.violations[checkName] or 0) + amount
@@ -377,12 +282,27 @@ local function markAlert(player, checkName)
     player.lastAlerts[checkName] = getTime()
 end
 
--- Flag a player
+local function recordFlag(name, checkName, vl)
+    local checks = flagHistory[name:lower()]
+    if not checks then
+        checks = {}
+        flagHistory[name:lower()] = checks
+    end
+
+    local entry = checks[checkName]
+    if not entry then
+        entry = { count = 0 }
+        checks[checkName] = entry
+    end
+    entry.count = entry.count + 1
+    entry.vl = vl
+    entry.lastAt = os.time()
+end
+
 local function flag(player, checkName, vl)
     local config = getCheckConfig(checkName)
     if not config or not config.enabled then return end
 
-    -- Mark the alert FIRST to prevent spam from rapid events
     markAlert(player, checkName)
 
     local cleanName = player.name or player.displayName or "Unknown"
@@ -390,6 +310,9 @@ local function flag(player, checkName, vl)
     local prefix = team and team.prefix or ""
     local suffix = team and team.suffix or ""
     local displayName = prefix .. cleanName .. suffix
+
+    recordFlag(cleanName, checkName, vl)
+    starfish.events.emit("anticheat:flag", { name = cleanName, check = checkName, vl = vl })
 
     starfish.debug("Flagging " .. displayName .. " for " .. checkName .. " (VL: " .. vl .. ")")
 
@@ -401,7 +324,8 @@ local function flag(player, checkName, vl)
     end
 end
 
--- Check: NoSlowA
+-- Checks
+
 local function checkNoSlowA(player)
     local config = getCheckConfig("NoSlowA")
     if not config or not config.enabled then return end
@@ -410,7 +334,7 @@ local function checkNoSlowA(player)
     local isUsingSlowdownItem = player.isUsingItem and (
         isHoldingConsumable(player) or
         isHoldingBow(player) or
-        (isHoldingSword(player) and player.isUsingItem)
+        isHoldingSword(player)
     )
 
     local isCurrentlyNoSlow = isUsingSlowdownItem and player.isSprinting
@@ -435,7 +359,6 @@ local function checkNoSlowA(player)
     end
 end
 
--- Check: AutoBlockA
 local function checkAutoBlockA(player)
     local config = getCheckConfig("AutoBlockA")
     if not config or not config.enabled then return end
@@ -491,7 +414,6 @@ local function checkAutoBlockA(player)
     end
 end
 
--- Check: EagleA
 local function checkEagleA(player)
     local config = getCheckConfig("EagleA")
     if not config or not config.enabled then return end
@@ -537,7 +459,6 @@ local function checkEagleA(player)
     end
 end
 
--- Check: ScaffoldA
 local function checkScaffoldA(player)
     local config = getCheckConfig("ScaffoldA")
     if not config or not config.enabled then return end
@@ -567,7 +488,6 @@ local function checkScaffoldA(player)
     end
 end
 
--- Check: ScaffoldB
 local function checkScaffoldB(player)
     local config = getCheckConfig("ScaffoldB")
     if not config or not config.enabled then return end
@@ -597,7 +517,6 @@ local function checkScaffoldB(player)
     end
 end
 
--- Check: TowerA
 local function checkTowerA(player)
     local config = getCheckConfig("TowerA")
     if not config or not config.enabled then return end
@@ -659,7 +578,6 @@ local function checkTowerA(player)
     end
 end
 
--- Check: LagRangeA
 local function checkLagRangeA(player)
     local config = getCheckConfig("LagRangeA")
     if not config or not config.enabled then return end
@@ -697,16 +615,10 @@ local function checkLagRangeA(player)
     end
 end
 
--- Check: NoBreakDelayA
--- Detects players breaking blocks with no delay between consecutive breaks
--- Normal Minecraft behavior: 6 tick delay between finishing one block and starting another
--- NoBreakDelay bypass: 0-1 tick delay between consecutive block breaks
-
 local MIN_BREAK_DELAY = 4
 local HISTORY_SIZE = 10
 local SUSPICIOUS_THRESHOLD = 1
 
--- Called when player STARTS breaking a new block (after a previous block finished)
 local function checkNoBreakDelayA(player, startTick)
     local config = getCheckConfig("NoBreakDelayA")
     if not config or not config.enabled then return end
@@ -738,7 +650,6 @@ local function checkNoBreakDelayA(player, startTick)
     end
 end
 
--- Run all checks on a player
 local function runChecks(player)
     checkNoSlowA(player)
     checkAutoBlockA(player)
@@ -748,7 +659,8 @@ local function runChecks(player)
     checkTowerA(player)
 end
 
--- Get or create player data
+-- Player tracking
+
 local function getOrCreatePlayer(playerData)
     local player = playersByUuid[playerData.uuid]
 
@@ -773,47 +685,44 @@ local function getOrCreatePlayer(playerData)
     return player
 end
 
--- Remove player by UUID
-local function removePlayerByUuid(uuid)
-    local player = playersByUuid[uuid]
-    if player then
-        players[player.name] = nil
-        playersByUuid[uuid] = nil
-        for entityId, p in pairs(entityToPlayer) do
-            if p.uuid == uuid then
-                entityToPlayer[entityId] = nil
-                break
-            end
-        end
-    end
+local function resolvePlayerName(uuid)
+    local name = uuidToName[uuid]
+    if name then return name end
+    local info = starfish.players.getInfo(uuid)
+    return (info and info.name) or "Unknown"
 end
 
--- Reset all tracking
+local function trackEntityPlayer(entity)
+    local player = playersByUuid[entity.uuid]
+    if player and player.entityId == entity.entityId then
+        return player
+    end
+
+    local name = resolvePlayerName(entity.uuid)
+    return getOrCreatePlayer({
+        name = name,
+        uuid = entity.uuid,
+        entityId = entity.entityId,
+        displayName = uuidToDisplayName[entity.uuid] or name
+    })
+end
+
 local function reset()
     players = {}
     playersByUuid = {}
     entityToPlayer = {}
     uuidToName = {}
     uuidToDisplayName = {}
+    flagHistory = {}
     starfish.debug("Anticheat: Cleared all tracked player data")
 end
 
--- Event: Entity move
+-- Event handlers
+
 local function onEntityMove(event)
     if not event.entity or event.entity.type ~= "player" or not event.entity.uuid then return end
 
-    local playerInfo = starfish.players.getInfo(event.entity.uuid)
-    local playerName = (playerInfo and playerInfo.name) or uuidToName[event.entity.uuid] or "Unknown"
-    local displayName = uuidToDisplayName[event.entity.uuid] or playerName
-
-    local playerData = {
-        name = playerName,
-        uuid = event.entity.uuid,
-        entityId = event.entity.entityId,
-        displayName = displayName
-    }
-
-    local player = getOrCreatePlayer(playerData)
+    local player = trackEntityPlayer(event.entity)
     if not player then return end
 
     if event.newPosition then
@@ -839,22 +748,10 @@ local function onEntityMove(event)
     runChecks(player)
 end
 
--- Event: Entity animation
 local function onEntityAnimation(event)
     if not event.entity or event.entity.type ~= "player" or not event.entity.uuid then return end
 
-    local playerInfo = starfish.players.getInfo(event.entity.uuid)
-    local playerName = (playerInfo and playerInfo.name) or uuidToName[event.entity.uuid] or "Unknown"
-    local displayName = uuidToDisplayName[event.entity.uuid] or playerName
-
-    local playerData = {
-        name = playerName,
-        uuid = event.entity.uuid,
-        entityId = event.entity.entityId,
-        displayName = displayName
-    }
-
-    local player = getOrCreatePlayer(playerData)
+    local player = trackEntityPlayer(event.entity)
     if not player then return end
 
     if event.animation == 0 then
@@ -867,26 +764,13 @@ local function onEntityAnimation(event)
     runChecks(player)
 end
 
--- Event: Entity metadata
 local function onEntityMetadata(event)
     if not event.entity or event.entity.type ~= "player" then return end
 
     local player = entityToPlayer[event.entity.entityId]
-
     if not player and event.entity.uuid then
-        local playerInfo = starfish.players.getInfo(event.entity.uuid)
-        local playerName = (playerInfo and playerInfo.name) or uuidToName[event.entity.uuid] or "Unknown"
-        local displayName = uuidToDisplayName[event.entity.uuid] or playerName
-
-        local playerData = {
-            name = playerName,
-            uuid = event.entity.uuid,
-            entityId = event.entity.entityId,
-            displayName = displayName
-        }
-        player = getOrCreatePlayer(playerData)
+        player = trackEntityPlayer(event.entity)
     end
-
     if not player then return end
 
     if event.metadata then
@@ -946,7 +830,6 @@ local function onEntityMetadata(event)
     runChecks(player)
 end
 
--- Event: Entity equipment
 local function onEntityEquipment(event)
     if not event.entity or not event.isPlayer then return end
 
@@ -958,7 +841,6 @@ local function onEntityEquipment(event)
     end
 end
 
--- Event: Entity status
 local function onEntityStatus(event)
     if not event.entity then return end
 
@@ -970,7 +852,6 @@ local function onEntityStatus(event)
     end
 end
 
--- Event: Player info (tab list)
 local function onPlayerInfo(event)
     if event.players then
         for _, update in ipairs(event.players) do
@@ -982,7 +863,6 @@ local function onPlayerInfo(event)
     end
 end
 
--- Event: Named entity spawn
 local function onNamedEntitySpawn(event)
     local data = event.player
     if not data then return end
@@ -1004,7 +884,6 @@ local function onNamedEntitySpawn(event)
     player.pitch = data.pitch
 end
 
--- Event: Entity destroy
 local function onEntityDestroy(event)
     if event.entities then
         for _, entity in ipairs(event.entities) do
@@ -1018,7 +897,6 @@ local function onEntityDestroy(event)
     end
 end
 
--- Event: Block change (for NoBreakDelayA) - records when a block FINISHES breaking
 local function onBlockChange(event)
     if event.blockId ~= 0 then return end
 
@@ -1038,19 +916,16 @@ local function onBlockChange(event)
     end
 end
 
--- Event: Respawn
 local function onRespawn(event)
     reset()
 end
 
--- Event: Plugin restored
 local function onPluginRestored(event)
     if event.pluginName == "anticheat" then
         reset()
     end
 end
 
--- Event: Block break animation - tracks when player STARTS breaking a new block
 local function onBlockBreakAnimation(event)
     local player = entityToPlayer[event.entityId]
     if not player then return end
@@ -1059,7 +934,6 @@ local function onBlockBreakAnimation(event)
     local data = player.breakDelayData
     local newPos = { x = event.x, y = event.y, z = event.z }
 
-    -- Check if this is a NEW block (different from current)
     local isNewBlock = not data.currentBreakPos or
         data.currentBreakPos.x ~= newPos.x or
         data.currentBreakPos.y ~= newPos.y or
@@ -1074,7 +948,8 @@ local function onBlockBreakAnimation(event)
     end
 end
 
--- Register event handlers
+-- Event wiring
+
 starfish.events.on("entity_move", onEntityMove)
 starfish.events.on("entity_animation", onEntityAnimation)
 starfish.events.on("entity_metadata", onEntityMetadata)
@@ -1087,9 +962,9 @@ starfish.events.on("block_change", onBlockChange)
 starfish.events.on("block_break_animation", onBlockBreakAnimation)
 starfish.events.on("respawn", onRespawn)
 starfish.events.on("plugin_restored", onPluginRestored)
+starfish.events.on("config_changed", function() configCache = {} end)
 
--- Tick handler
-local tickId = starfish.events.everyTick(function()
+starfish.events.everyTick(function()
     currentTick = currentTick + 1
     for uuid, player in pairs(playersByUuid) do
         if player.swingProgress > 0 then
@@ -1097,4 +972,19 @@ local tickId = starfish.events.everyTick(function()
         end
         checkLagRangeA(player)
     end
+end)
+
+-- Exports
+
+starfish.api.export("getFlags", function(name)
+    if not name then return nil end
+    local checks = flagHistory[name:lower()]
+    if not checks then return nil end
+
+    local result = {}
+    for check, entry in pairs(checks) do
+        table.insert(result, { check = check, count = entry.count, vl = entry.vl, lastAt = entry.lastAt })
+    end
+    table.sort(result, function(a, b) return a.count > b.count end)
+    return result
 end)
