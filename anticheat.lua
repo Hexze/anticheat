@@ -2,8 +2,9 @@ plugin = {
     name = "anticheat",
     displayName = "Cheater Detector",
     prefix = "§cAC",
-    version = "0.4.0",
-    credits = "",
+    version = "0.5.0",
+    author = "pugbw",
+    credits = "pugbw",
     description = "Advanced cheater detector system"
 }
 
@@ -115,6 +116,7 @@ local entityToPlayer = {}
 local uuidToName = {}
 local uuidToDisplayName = {}
 local flagHistory = {}
+local flaggedUuids = {}
 local currentTick = 0
 
 -- Item IDs
@@ -132,7 +134,7 @@ local CONSUMABLE_IDS = {
 -- Helpers
 
 local function getTime()
-    return os.clock() * 1000
+    return starfish.time.monotonic()
 end
 
 local function createPlayerData(uuid, name, entityId)
@@ -299,6 +301,13 @@ local function recordFlag(name, checkName, vl)
     entry.lastAt = os.time()
 end
 
+local function markFlagged(uuid)
+    if not uuid or flaggedUuids[uuid] then return end
+    flaggedUuids[uuid] = true
+    starfish.display.prependPrefix(uuid, "§n")
+    starfish.display.appendSuffix(uuid, " §r§c[!]")
+end
+
 local function flag(player, checkName, vl)
     local config = getCheckConfig(checkName)
     if not config or not config.enabled then return end
@@ -306,21 +315,23 @@ local function flag(player, checkName, vl)
     markAlert(player, checkName)
 
     local cleanName = player.name or player.displayName or "Unknown"
-    local team = starfish.players.getTeam(cleanName)
+    local cleanPlayer = starfish.players.byName(cleanName)
+    local team = cleanPlayer and cleanPlayer.team
     local prefix = team and team.prefix or ""
     local suffix = team and team.suffix or ""
     local displayName = prefix .. cleanName .. suffix
 
     recordFlag(cleanName, checkName, vl)
+    markFlagged(player.uuid)
     starfish.events.emit("anticheat:flag", { name = cleanName, check = checkName, vl = vl })
 
-    starfish.debug("Flagging " .. displayName .. " for " .. checkName .. " (VL: " .. vl .. ")")
+    starfish.log.debug("Flagging " .. displayName .. " for " .. checkName .. " (VL: " .. vl .. ")")
 
     local message = displayName .. " §7flagged §5" .. checkName .. " §8(§7VL: " .. vl .. "§8)"
-    starfish.chat.send(starfish.chat.prefix(message))
+    starfish.chat.info(message)
 
     if config.sound then
-        starfish.chat.sound("note.pling", 1.0, 1.0)
+        starfish.client.world.playSound("note.pling", { volume = 1.0, pitch = 1.0 })
     end
 end
 
@@ -688,23 +699,31 @@ end
 local function resolvePlayerName(uuid)
     local name = uuidToName[uuid]
     if name then return name end
-    local info = starfish.players.getInfo(uuid)
+    local info = starfish.players.byUuid(uuid)
     return (info and info.name) or "Unknown"
 end
 
-local function trackEntityPlayer(entity)
-    local player = playersByUuid[entity.uuid]
-    if player and player.entityId == entity.entityId then
+local function trackEntityPlayer(entityId, uuid)
+    local player = playersByUuid[uuid]
+    if player and player.entityId == entityId then
         return player
     end
 
-    local name = resolvePlayerName(entity.uuid)
+    local name = resolvePlayerName(uuid)
     return getOrCreatePlayer({
         name = name,
-        uuid = entity.uuid,
-        entityId = entity.entityId,
-        displayName = uuidToDisplayName[entity.uuid] or name
+        uuid = uuid,
+        entityId = entityId,
+        displayName = uuidToDisplayName[uuid] or name
     })
+end
+
+local function clearFlaggedDisplays()
+    for uuid in pairs(flaggedUuids) do
+        starfish.display.clearPrefix(uuid)
+        starfish.display.clearSuffix(uuid)
+    end
+    flaggedUuids = {}
 end
 
 local function reset()
@@ -714,7 +733,8 @@ local function reset()
     uuidToName = {}
     uuidToDisplayName = {}
     flagHistory = {}
-    starfish.debug("Anticheat: Cleared all tracked player data")
+    clearFlaggedDisplays()
+    starfish.log.debug("Anticheat: Cleared all tracked player data")
 end
 
 -- Event handlers
@@ -722,14 +742,14 @@ end
 local function onEntityMove(event)
     if not event.entity or event.entity.type ~= "player" or not event.entity.uuid then return end
 
-    local player = trackEntityPlayer(event.entity)
+    local player = trackEntityPlayer(event.entity.entityId, event.entity.uuid)
     if not player then return end
 
-    if event.newPosition then
+    if event.position then
         updatePosition(player,
-            event.newPosition.x,
-            event.newPosition.y,
-            event.newPosition.z,
+            event.position.x,
+            event.position.y,
+            event.position.z,
             true,
             event.rotation and event.rotation.yaw,
             event.rotation and event.rotation.pitch
@@ -751,7 +771,7 @@ end
 local function onEntityAnimation(event)
     if not event.entity or event.entity.type ~= "player" or not event.entity.uuid then return end
 
-    local player = trackEntityPlayer(event.entity)
+    local player = trackEntityPlayer(event.entity.entityId, event.entity.uuid)
     if not player then return end
 
     if event.animation == 0 then
@@ -764,67 +784,64 @@ local function onEntityAnimation(event)
     runChecks(player)
 end
 
-local function onEntityMetadata(event)
-    if not event.entity or event.entity.type ~= "player" then return end
+local function onEntityStateChange(e)
+    if e.entity.kind ~= "minecraft:player" then return end
 
-    local player = entityToPlayer[event.entity.entityId]
-    if not player and event.entity.uuid then
-        player = trackEntityPlayer(event.entity)
+    local player = entityToPlayer[e.entity.id]
+    if not player and e.entity.uuid then
+        player = trackEntityPlayer(e.entity.id, e.entity.uuid)
     end
     if not player then return end
 
-    if event.metadata then
-        for _, meta in ipairs(event.metadata) do
-            if meta.key == 0 and meta.type == 0 then
-                local flags = meta.value
-                local now = getTime()
+    local now = getTime()
 
-                local wasCrouching = player.isCrouching
-                player.isCrouching = (flags & 0x02) ~= 0
+    if e.changed.sneaking then
+        local wasCrouching = player.isCrouching
+        player.isCrouching = e.state.sneaking
 
-                if player.isCrouching and not wasCrouching then
-                    player.lastCrouchTime = now
-                    player.currentShiftStart = now
-                    table.insert(player.shiftEvents, {
-                        eventType = "start",
-                        timestamp = now,
-                        position = { x = player.position.x, y = player.position.y, z = player.position.z }
-                    })
-                    if #player.shiftEvents > 50 then
-                        table.remove(player.shiftEvents, 1)
-                    end
-                elseif not player.isCrouching and wasCrouching then
-                    player.lastStopCrouchTime = now
-                    local duration = player.currentShiftStart and (now - player.currentShiftStart) or 0
-                    table.insert(player.shiftEvents, {
-                        eventType = "stop",
-                        timestamp = now,
-                        position = { x = player.position.x, y = player.position.y, z = player.position.z },
-                        duration = duration
-                    })
-                    player.currentShiftStart = nil
-                    if #player.shiftEvents > 50 then
-                        table.remove(player.shiftEvents, 1)
-                    end
-                end
-
-                player.isSprinting = (flags & 0x08) ~= 0
-
-                local wasUsingItem = player.isUsingItem
-                player.isUsingItem = (flags & 0x10) ~= 0
-
-                if player.isUsingItem and not wasUsingItem and isHoldingSword(player) then
-                    player.isBlocking = true
-                    player.blockingStartTime = now
-                elseif not player.isUsingItem and wasUsingItem then
-                    player.isBlocking = false
-                end
-
-                if player.isUsingItem ~= player.lastUsing then
-                    player.lastUsing = player.isUsingItem
-                end
+        if player.isCrouching and not wasCrouching then
+            player.lastCrouchTime = now
+            player.currentShiftStart = now
+            table.insert(player.shiftEvents, {
+                eventType = "start",
+                timestamp = now,
+                position = { x = player.position.x, y = player.position.y, z = player.position.z }
+            })
+            if #player.shiftEvents > 50 then
+                table.remove(player.shiftEvents, 1)
+            end
+        elseif not player.isCrouching and wasCrouching then
+            player.lastStopCrouchTime = now
+            local duration = player.currentShiftStart and (now - player.currentShiftStart) or 0
+            table.insert(player.shiftEvents, {
+                eventType = "stop",
+                timestamp = now,
+                position = { x = player.position.x, y = player.position.y, z = player.position.z },
+                duration = duration
+            })
+            player.currentShiftStart = nil
+            if #player.shiftEvents > 50 then
+                table.remove(player.shiftEvents, 1)
             end
         end
+    end
+
+    if e.changed.sprinting then
+        player.isSprinting = e.state.sprinting
+    end
+
+    if e.changed.usingItem then
+        local wasUsingItem = player.isUsingItem
+        player.isUsingItem = e.state.usingItem
+
+        if player.isUsingItem and not wasUsingItem and isHoldingSword(player) then
+            player.isBlocking = true
+            player.blockingStartTime = now
+        elseif not player.isUsingItem and wasUsingItem then
+            player.isBlocking = false
+        end
+
+        player.lastUsing = player.isUsingItem
     end
 
     runChecks(player)
@@ -836,7 +853,7 @@ local function onEntityEquipment(event)
     local player = entityToPlayer[event.entity.entityId]
     if not player then return end
 
-    if event.slot == 0 then
+    if event.slot == "held" then
         player.heldItem = event.item
     end
 end
@@ -852,47 +869,72 @@ local function onEntityStatus(event)
     end
 end
 
-local function onPlayerInfo(event)
-    if event.players then
-        for _, update in ipairs(event.players) do
-            if update.name and update.uuid then
-                uuidToName[update.uuid] = update.name
-                uuidToDisplayName[update.uuid] = update.displayName or update.name
-            end
+local function forgetPlayer(uuid)
+    if flaggedUuids[uuid] then
+        starfish.display.clearPrefix(uuid)
+        starfish.display.clearSuffix(uuid)
+        flaggedUuids[uuid] = nil
+    end
+
+    local player = playersByUuid[uuid]
+    if player then
+        players[player.name] = nil
+        playersByUuid[uuid] = nil
+        if player.entityId and player.entityId ~= -1 then
+            entityToPlayer[player.entityId] = nil
         end
     end
 end
 
-local function onNamedEntitySpawn(event)
-    local data = event.player
-    if not data then return end
+local function onPlayerInfo(event)
+    if not event.players then return end
 
-    local playerName = uuidToName[data.playerUUID] or "Unknown"
-    local displayName = uuidToDisplayName[data.playerUUID] or playerName
+    if event.action == "remove" then
+        for _, update in ipairs(event.players) do
+            if update.uuid then
+                forgetPlayer(update.uuid)
+            end
+        end
+        return
+    end
+
+    for _, update in ipairs(event.players) do
+        if update.name and update.uuid then
+            uuidToName[update.uuid] = update.name
+            uuidToDisplayName[update.uuid] = update.displayName or update.name
+        end
+    end
+end
+
+local function onEntitySpawn(event)
+    if event.kind ~= "player" or not event.uuid then return end
+
+    local playerName = uuidToName[event.uuid] or "Unknown"
+    local displayName = uuidToDisplayName[event.uuid] or playerName
 
     local playerData = {
         name = playerName,
-        uuid = data.playerUUID,
-        entityId = data.entityId,
+        uuid = event.uuid,
+        entityId = event.entityId,
         displayName = displayName
     }
 
     local player = getOrCreatePlayer(playerData)
 
-    updatePosition(player, data.position.x, data.position.y, data.position.z, false)
-    player.yaw = data.yaw
-    player.pitch = data.pitch
+    updatePosition(player, event.x, event.y, event.z, false)
+    player.yaw = event.yaw
+    player.pitch = event.pitch
 end
 
 local function onEntityDestroy(event)
-    if event.entities then
-        for _, entity in ipairs(event.entities) do
-            local player = entityToPlayer[entity.entityId]
-            if player then
-                players[player.name] = nil
-                playersByUuid[player.uuid] = nil
-                entityToPlayer[entity.entityId] = nil
-            end
+    if not event.entityIds then return end
+
+    for _, entityId in ipairs(event.entityIds) do
+        local player = entityToPlayer[entityId]
+        if player then
+            players[player.name] = nil
+            playersByUuid[player.uuid] = nil
+            entityToPlayer[entityId] = nil
         end
     end
 end
@@ -920,12 +962,6 @@ local function onRespawn(event)
     reset()
 end
 
-local function onPluginRestored(event)
-    if event.pluginName == "anticheat" then
-        reset()
-    end
-end
-
 local function onBlockBreakAnimation(event)
     local player = entityToPlayer[event.entityId]
     if not player then return end
@@ -950,21 +986,20 @@ end
 
 -- Event wiring
 
-starfish.events.on("entity_move", onEntityMove)
-starfish.events.on("entity_animation", onEntityAnimation)
-starfish.events.on("entity_metadata", onEntityMetadata)
-starfish.events.on("entity_equipment", onEntityEquipment)
-starfish.events.on("entity_status", onEntityStatus)
-starfish.events.on("player_info", onPlayerInfo)
-starfish.events.on("named_entity_spawn", onNamedEntitySpawn)
-starfish.events.on("entity_destroy", onEntityDestroy)
-starfish.events.on("block_change", onBlockChange)
-starfish.events.on("block_break_animation", onBlockBreakAnimation)
-starfish.events.on("respawn", onRespawn)
-starfish.events.on("plugin_restored", onPluginRestored)
-starfish.events.on("config_changed", function() configCache = {} end)
+starfish.entities.onMove(onEntityMove)
+starfish.events.on("entity:animation", onEntityAnimation)
+starfish.entities.onStateChange(onEntityStateChange)
+starfish.entities.onEquipmentChange(onEntityEquipment)
+starfish.events.on("entity:status", onEntityStatus)
+starfish.events.on("player:listUpdate", onPlayerInfo)
+starfish.entities.onSpawn(onEntitySpawn)
+starfish.entities.onDespawn(onEntityDestroy)
+starfish.events.on("world:blockChange", onBlockChange)
+starfish.events.on("world:blockBreakAnimation", onBlockBreakAnimation)
+starfish.events.on("world:respawn", onRespawn)
+starfish.events.on("config:changed", function() configCache = {} end)
 
-starfish.events.everyTick(function()
+starfish.timers.everyTick(function()
     currentTick = currentTick + 1
     for uuid, player in pairs(playersByUuid) do
         if player.swingProgress > 0 then
@@ -976,7 +1011,7 @@ end)
 
 -- Exports
 
-starfish.api.export("getFlags", function(name)
+starfish.plugin.export("getFlags", function(name)
     if not name then return nil end
     local checks = flagHistory[name:lower()]
     if not checks then return nil end
