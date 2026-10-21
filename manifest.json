@@ -1,0 +1,9 @@
+{
+  "name": "anticheat",
+  "display_name": "Cheater Detector",
+  "version": "1.0.0",
+  "description": "Scans players to detect patterns that can indicate cheating",
+  "homepage": null,
+  "dependencies": [],
+  "min_starfish_version": null
+}
